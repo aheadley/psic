@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 
 """
+Heavily based on the following code:
+http://pastebin.com/GZzRaYiP
+http://code.google.com/p/pspshrink/
 """
 
 __author__  = 'Alex Headley <aheadley@waysaboutstuff.com>'
@@ -69,6 +72,7 @@ class CisoWorker(object):
                         except zlib.error as err:
                             # do nothing for now
                             raise err
+
                     out_file_handle.write(block)
 
     def compress(self, in_file, out_file, level=ZLIB_DEFAULT_LEVEL):
@@ -100,3 +104,9 @@ class CisoWorker(object):
         )
 
 assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
+
+if __name__ == '__main__':
+    import sys
+
+    worker = CisoWorker()
+    worker.decompress(sys.argv[1], sys.argv[2])
