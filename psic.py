@@ -15,10 +15,9 @@ import struct
 import logging
 import os
 
-ZLIB_DEFAULT_LEVEL  = 1
+# constrain the value to 1-9
+ZLIB_DEFAULT_LEVEL  = max(1, min(9, int(os.environ.get('ZLIB_DEFAULT_LEVEL', '1'))))
 ZLIB_WINDOW_SIZE    = -15
-
-PADDING_BYTE        = b'X'
 
 class CisoWorker(object):
     CISO_HEADER_FMT     = ''.join([
@@ -29,11 +28,10 @@ class CisoWorker(object):
         'I',    # compressed block size
         'B',    # version number
         'B',    # alignment of index value
-        'H',   # reserved
+        'H',    # reserved
     ])
     CISO_HEADER_SIZE    = 0x18
-    # CISO_MAGIC      = (chr(c) for c in 'CISO')
-    CISO_MAGIC      = 0x4F534943 # 'C', 'I', 'S', 'O'
+    CISO_MAGIC      = 0x4F534943 # 'CISO'
     CISO_VER        = 0x01
     CISO_BLOCK_SIZE = 0x0800
     CISO_INDEX_FMT  = '<%dI'
@@ -41,11 +39,9 @@ class CisoWorker(object):
     UNCOMPRESSED_BITMASK    = 0x80000000
     INDEX_BITMASK           = 0x7FFFFFFF
 
-    COMPRESSION_THRESHOLD   = 90
+assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
 
-    def __init__(self):
-        pass
-
+class CisoDecompressor(CisoWorker):
     def decompress(self, input_handle, output_handle):
         """Decompress a CSO
         """
@@ -59,13 +55,14 @@ class CisoWorker(object):
         decompress_block = lambda i, bi: \
             self._decompress_block(input_handle.read, i, bi,
                 header['align'], header['block_size'])
+
         for block_i in xrange(block_count):
             output_handle.write(decompress_block(index_buffer, block_i))
 
     def _decompress_block(self, read, index_buffer, block_i, align, block_size):
         index = index_buffer[block_i] & self.INDEX_BITMASK
         compressed = not (index_buffer[block_i] & self.UNCOMPRESSED_BITMASK)
-        # block_start = index << align
+        # read_pos = index << align
 
         real_block_size = block_size
         if compressed:
@@ -75,14 +72,39 @@ class CisoWorker(object):
             else:
                 real_block_size = (next_index - index) << align
 
-        # input_handle.seek(block_start)
         block = read(real_block_size)
+        # block = read(real_block_size, read_pos)
 
         if not compressed:
             return block
         else:
             # TODO: error handling here
             return zlib.decompress(block, ZLIB_WINDOW_SIZE)
+
+    def _read_header(self, header_bytes):
+        header_struct = struct.unpack(self.CISO_HEADER_FMT,
+            header_bytes[:self.CISO_HEADER_SIZE])
+        header_data = {
+            'magic':        header_struct[0],
+            'header_size':  header_struct[1],
+            'file_size':    header_struct[2],
+            'block_size':   header_struct[3],
+            'version':      header_struct[4],
+            'align':        header_struct[5],
+            'reserved':     header_struct[6],
+        }
+        return header_data
+
+class CisoCompressor(CisoWorker):
+    PADDING_BYTE            = b'X'
+    COMPRESSION_THRESHOLD   = 90
+    COMPRESSION_LEVEL       = ZLIB_DEFAULT_LEVEL
+
+    def __init__(self, level=COMPRESSION_LEVEL, threshold=COMPRESSION_THRESHOLD,
+            padding_byte=PADDING_BYTE):
+        self.COMPRESSION_LEVEL = level
+        self.COMPRESSION_THRESHOLD = threshold
+        self.PADDING_BYTE = padding_byte
 
     def compress(self, input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
         """Compress a ISO into a CSO
@@ -125,6 +147,9 @@ class CisoWorker(object):
             block = compressed_block
         return index, padding + block
 
+    def _zlib_compress(self, data, level):
+        return zlib.compress(data, level)[2:]
+
     def _get_align_padding(self, write_pos, align):
         align_shift = 1 << align
         if write_pos % align_shift:
@@ -140,20 +165,6 @@ class CisoWorker(object):
         stream.seek(current_pos)
         return size
 
-    def _read_header(self, header_bytes):
-        header_struct = struct.unpack(self.CISO_HEADER_FMT,
-            header_bytes[:self.CISO_HEADER_SIZE])
-        header_data = {
-            'magic':        header_struct[0],
-            'header_size':  header_struct[1],
-            'file_size':    header_struct[2],
-            'block_size':   header_struct[3],
-            'version':      header_struct[4],
-            'align':        header_struct[5],
-            'reserved':     header_struct[6],
-        }
-        return header_data
-
     def _build_header(self, file_size, block_size, align):
         return struct.pack(self.CISO_HEADER_FMT,
             self.CISO_MAGIC,
@@ -165,13 +176,18 @@ class CisoWorker(object):
             0
         )
 
-assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
+def decompress(input_handle, output_handle):
+    worker = CisoDecompressor()
+    return worker.decompress(input_handle, output_handle)
+
+def compress(input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
+    worker = CisoCompressor(level)
+    return worker.compress(input_handle, output_handle, level)
 
 if __name__ == '__main__':
     import sys
 
-    worker = CisoWorker()
     if '-d' in ' '.join(sys.argv[1:]):
-        worker.decompress(sys.stdin, sys.stdout)
+        decompress(sys.stdin, sys.stdout)
     else:
-        worker.compress(sys.stdin, sys.stdout)
+        compress(sys.stdin, sys.stdout)
