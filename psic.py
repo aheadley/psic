@@ -12,95 +12,157 @@ __version__ = '0.1'
 
 import zlib
 import struct
+import logging
+import os
 
 ZLIB_DEFAULT_LEVEL  = 1
+ZLIB_WINDOW_SIZE    = -15
+
+PADDING_BYTE        = b'X'
 
 class CisoWorker(object):
     CISO_HEADER_FMT     = ''.join([
         '<',    # ensure little endian
-        '4B',   # magic ('C', 'I', 'S', 'O')
+        'I',    # file format magic
         'I',    # header size
         'Q',    # size of uncompressed file
         'I',    # compressed block size
         'B',    # version number
         'B',    # alignment of index value
-        '2B',   # reserved
+        'H',   # reserved
     ])
     CISO_HEADER_SIZE    = 0x18
-    # CISO_MAGIC      = ('C', 'I', 'S', 'O')
-    CISO_MAGIC      = (chr(c) for c in 'CISO')
-    # CISO_MAGIC      = 0x4F534943
+    # CISO_MAGIC      = (chr(c) for c in 'CISO')
+    CISO_MAGIC      = 0x4F534943 # 'C', 'I', 'S', 'O'
     CISO_VER        = 0x01
     CISO_BLOCK_SIZE = 0x0800
-    CISO_INDEX      = '<I'
+    CISO_INDEX_FMT  = '<%dI'
 
-    PLAIN_BITMASK   = 0x80000000
-    INDEX_BITMASK   = 0x7FFFFFFF
+    UNCOMPRESSED_BITMASK    = 0x80000000
+    INDEX_BITMASK           = 0x7FFFFFFF
+
+    COMPRESSION_THRESHOLD   = 90
 
     def __init__(self):
         pass
 
-    def decompress(self, in_file, out_file):
-        with open(in_file, 'rb') as in_file_handle:
-            header = self._read_header(in_file_handle.read(self.CISO_HEADER_SIZE))
-            block_count = header['file_size'] / header['block_size']
-            index_buffer_fmt = '<%dI' % (block_count + 1)
-            index_buffer_size = struct.calcsize(index_buffer_fmt)
-            index_buffer = struct.unpack(index_buffer_fmt,
-                in_file_handle.read(index_buffer_size))
-            with open(out_file, 'wb') as out_file_handle:
-                for block_i in xrange(block_count):
-                    index = index_buffer[block_i]
-                    uncompressed = index & self.PLAIN_BITMASK
-                    index &= self.INDEX_BITMASK
-                    jump = index << header['align']
+    def decompress(self, input_handle, output_handle):
+        """Decompress a CSO
+        """
+        header = self._read_header(input_handle.read(self.CISO_HEADER_SIZE))
+        block_count = header['file_size'] / header['block_size']
+        index_buffer_fmt = self.CISO_INDEX_FMT % (block_count + 1)
+        index_buffer_size = struct.calcsize(index_buffer_fmt)
+        index_buffer = struct.unpack(index_buffer_fmt,
+            input_handle.read(index_buffer_size))
 
-                    if uncompressed:
-                        read_size = header['block_size']
-                    else:
-                        extra_index = index_buffer[block_i+1] & self.INDEX_BITMASK
-                        if header['align']:
-                            read_size = (extra_index - index + 1) << header['align']
-                        else:
-                            read_size = (extra_index - index) << header['align']
-                    in_file_handle.seek(jump)
-                    block = in_file_handle.read(read_size)
+        decompress_block = lambda i, bi: \
+            self._decompress_block(input_handle.read, i, bi,
+                header['align'], header['block_size'])
+        for block_i in xrange(block_count):
+            output_handle.write(decompress_block(index_buffer, block_i))
 
-                    if not uncompressed:
-                        try:
-                            block = zlib.decompress(block, -15)
-                        except zlib.error as err:
-                            # do nothing for now
-                            raise err
+    def _decompress_block(self, read, index_buffer, block_i, align, block_size):
+        index = index_buffer[block_i] & self.INDEX_BITMASK
+        compressed = not (index_buffer[block_i] & self.UNCOMPRESSED_BITMASK)
+        # block_start = index << align
 
-                    out_file_handle.write(block)
+        real_block_size = block_size
+        if compressed:
+            next_index = index_buffer[block_i+1] & self.INDEX_BITMASK
+            if align:
+                real_block_size = (next_index - index + 1) << align
+            else:
+                real_block_size = (next_index - index) << align
 
-    def compress(self, in_file, out_file, level=ZLIB_DEFAULT_LEVEL):
-        pass
+        # input_handle.seek(block_start)
+        block = read(real_block_size)
 
-    def _read_header(self, data):
-        header = struct.unpack(self.CISO_HEADER_FMT,
-            data[:self.CISO_HEADER_SIZE])
+        if not compressed:
+            return block
+        else:
+            # TODO: error handling here
+            return zlib.decompress(block, ZLIB_WINDOW_SIZE)
+
+    def compress(self, input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
+        """Compress a ISO into a CSO
+        """
+        file_size = self._get_stream_size(input_handle)
+        if file_size >= 2 ** 31:
+            align = 1
+        else:
+            align = 0
+        header = self._build_header(file_size, self.CISO_BLOCK_SIZE, align)
+        output_handle.write(header)
+
+        block_count = file_size / self.CISO_BLOCK_SIZE
+        index_buffer = [0] * (block_count + 1)
+        output_handle.write(b'\x00\x00\x00\x00' * len(index_buffer))
+        compress_block = lambda write_pos: self._compress_block(input_handle.read,
+            write_pos, self.COMPRESSION_THRESHOLD, level, align, self.CISO_BLOCK_SIZE)
+        for block_i in xrange(block_count):
+            index, block = compress_block(output_handle.tell())
+            index_buffer[block_i] = index
+            output_handle.write(block)
+        index_buffer[-1] = output_handle.tell() >> align
+
+        output_handle.seek(self.CISO_HEADER_SIZE)
+        output_handle.write(struct.pack(self.CISO_INDEX_FMT % len(index_buffer),
+            *index_buffer))
+
+    def _compress_block(self, read, write_pos, threshold, level, align, block_size):
+        uncompressed_block = read(block_size)
+        # TODO: error handling here
+        compressed_block = zlib.compress(uncompressed_block, level)[2:]
+        padding = self._get_align_padding(write_pos, align)
+        index = (write_pos + len(padding)) >> align
+        if (100 * len(compressed_block)) / len(uncompressed_block) >= threshold:
+            block = uncompressed_block
+            index |= self.UNCOMPRESSED_BITMASK
+        elif index & self.UNCOMPRESSED_BITMASK:
+            raise Exception('Align error')
+        else:
+            block = compressed_block
+        return index, padding + block
+
+    def _get_align_padding(self, write_pos, align):
+        align_shift = 1 << align
+        if write_pos % align_shift:
+            padding = PADDING_BYTE * (align_shift - write_pos % align_shift)
+        else:
+            padding = ''
+        return padding
+
+    def _get_stream_size(self, stream):
+        current_pos = stream.tell()
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(current_pos)
+        return size
+
+    def _read_header(self, header_bytes):
+        header_struct = struct.unpack(self.CISO_HEADER_FMT,
+            header_bytes[:self.CISO_HEADER_SIZE])
         header_data = {
-            'magic':        header[0:4],
-            'header_size':  header[4],
-            'file_size':    header[5],
-            'block_size':   header[6],
-            'version':      header[7],
-            'align':        header[8],
-            'reserved':     header[9:],
+            'magic':        header_struct[0],
+            'header_size':  header_struct[1],
+            'file_size':    header_struct[2],
+            'block_size':   header_struct[3],
+            'version':      header_struct[4],
+            'align':        header_struct[5],
+            'reserved':     header_struct[6],
         }
         return header_data
 
-    def _build_header(self, header_data):
+    def _build_header(self, file_size, block_size, align):
         return struct.pack(self.CISO_HEADER_FMT,
-            header_data['magic'],
-            header_data['header_size'],
-            header_data['file_size'],
-            header_data['block_size'],
-            header_data['version'],
-            header_data['align'],
-            header_data['reserved']
+            self.CISO_MAGIC,
+            self.CISO_HEADER_SIZE,
+            file_size,
+            block_size,
+            self.CISO_VER,
+            align,
+            0
         )
 
 assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
@@ -109,4 +171,7 @@ if __name__ == '__main__':
     import sys
 
     worker = CisoWorker()
-    worker.decompress(sys.argv[1], sys.argv[2])
+    if '-d' in ' '.join(sys.argv[1:]):
+        worker.decompress(sys.stdin, sys.stdout)
+    else:
+        worker.compress(sys.stdin, sys.stdout)
