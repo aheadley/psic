@@ -93,6 +93,8 @@ class CisoDecompressor(CisoWorker):
             'align':        header_struct[5],
             'reserved':     header_struct[6],
         }
+        if header_struct[0] != self.CISO_MAGIC:
+            raise Exception('CISO magic not found')
         return header_data
 
 class CisoCompressor(CisoWorker):
@@ -186,8 +188,45 @@ def compress(input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
 
 if __name__ == '__main__':
     import sys
+    import optparse
 
-    if '-d' in ' '.join(sys.argv[1:]):
-        decompress(sys.stdin, sys.stdout)
+    parser = optparse.OptionParser()
+    parser.add_option('-d', '--decompress',
+        action='store_true', default=False,
+        help='Decompress a CSO file')
+    parser.add_option('-l', '--level',
+        action='store', type='int', default=ZLIB_DEFAULT_LEVEL,
+        help='Compression level to use (1-9)')
+
+    opts, args = parser.parse_args()
+
+    if opts.decompress:
+        worker = lambda i, o: decompress(i, o)
     else:
-        compress(sys.stdin, sys.stdout)
+        worker = lambda i, o: compress(i, o, opts.level)
+
+    if len(args) == 0:
+        worker(sys.stdin, sys.stdout)
+    else:
+        if len(args) == 1:
+            in_filename = args[0]
+            parts = os.path.splitext(in_filename)
+            if opts.decompress:
+                if parts[1].lower() == '.cso':
+                    out_filename = parts[0] + '.iso'
+                else:
+                    out_filename = in_filename + '.iso'
+            else:
+                if parts[1].lower() == '.iso':
+                    out_filename = parts[0] + '.cso'
+                else:
+                    out_filename = in_filename + '.cso'
+
+            if os.path.exists(out_filename):
+                raise Exception('Output file already exists, not clobbering!')
+        elif len(args) == 2:
+            in_filename = args[0]
+            out_filename = args[1]
+        with open(in_filename, 'rb') as in_file:
+            with open(out_filename, 'wb') as out_file:
+                worker(in_file, out_file)
