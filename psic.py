@@ -80,7 +80,7 @@ class IndexedBlockIterator(object):
 
 class CisoDecompressor(CisoWorker):
     def __init__(self, threads=None):
-        self._pool = multiprocessing.pool.ThreadPool(threads)
+        self._pool = multiprocessing.pool.Pool(threads)
 
     def decompress(self, input_handle, output_handle):
         """Decompress a CSO
@@ -91,12 +91,9 @@ class CisoDecompressor(CisoWorker):
         index_buffer = struct.unpack(index_buffer_fmt,
             input_handle.read(struct.calcsize(index_buffer_fmt)))
 
-        work_func = lambda args: zlib.decompress(args[1], ZLIB_WINDOW_SIZE) \
-            if args[0] else args[1]
-
         block_iter = IndexedBlockIterator(
             input_handle, header['align'], index_buffer)
-        for block_data in self._pool.map(work_func, block_iter):
+        for block_data in self._pool.map(_decompress_mp_helper, block_iter):
             output_handle.write(block_data)
 
     def _read_header(self, header_bytes):
@@ -114,6 +111,12 @@ class CisoDecompressor(CisoWorker):
         if header_struct[0] != self.CISO_MAGIC:
             raise Exception('CISO magic not found')
         return header_data
+
+def _decompress_mp_helper(args):
+    if args[0]:
+        return zlib.decompress(args[1], ZLIB_WINDOW_SIZE)
+    else:
+        return args[1]
 
 class CisoCompressor(CisoWorker):
     PADDING_BYTE            = b'X'
@@ -140,16 +143,11 @@ class CisoCompressor(CisoWorker):
         index_buffer = [0] * (block_count + 1)
         output_handle.write(b'\x00\x00\x00\x00' * len(index_buffer))
 
-        def work_func(data):
-            compressed_data = zlib.compress(data, self.COMPRESSION_LEVEL)[2:]
-            if (100 * len(compressed_data)) / len(data) >= \
-                    self.COMPRESSION_THRESHOLD:
-                return False, data
-            else:
-                return True, compressed_data
-
-        for (block_i, (compressed, data)) in enumerate(self._pool.map(work_func,
-                (input_handle.read(self.CISO_BLOCK_SIZE) for _ in xrange(block_count)))):
+        for (block_i, (compressed, data)) in enumerate(self._pool.map(
+                _compress_mp_helper,
+                ((input_handle.read(self.CISO_BLOCK_SIZE),
+                        self.COMPRESSION_LEVEL, self.COMPRESSION_THRESHOLD)
+                    for _ in xrange(block_count)))):
             write_pos = output_handle.tell()
             padding = self._get_align_padding(write_pos, align)
             index = (write_pos + len(padding)) >> align
@@ -193,12 +191,19 @@ class CisoCompressor(CisoWorker):
             0
         )
 
-def decompress(input_handle, output_handle):
-    worker = CisoDecompressor()
+def _compress_mp_helper(args):
+    compressed_data = zlib.compress(args[0], args[1])[2:]
+    if (100 * len(compressed_data)) / len(args[0]) >= args[2]:
+        return False, args[0]
+    else:
+        return True, compressed_data
+
+def decompress(input_handle, output_handle, threads):
+    worker = CisoDecompressor(threads)
     return worker.decompress(input_handle, output_handle)
 
-def compress(input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
-    worker = CisoCompressor(level=level)
+def compress(input_handle, output_handle, threads, level=ZLIB_DEFAULT_LEVEL):
+    worker = CisoCompressor(threads, level=level)
     return worker.compress(input_handle, output_handle)
 
 
@@ -215,14 +220,13 @@ if __name__ == '__main__':
         help='Compression level to use (1-9)')
     parser.add_option('-t', '--threads',
         action='store', type='int', default=None,
-        help='Number of threads to use')
+        help='Number of threads/processes to use')
 
     opts, args = parser.parse_args()
-
     if opts.decompress:
-        worker = lambda i, o: decompress(i, o)
+        worker = lambda i, o: decompress(i, o, opts.threads)
     else:
-        worker = lambda i, o: compress(i, o, opts.level)
+        worker = lambda i, o: compress(i, o, opts.threads, opts.level)
 
     if len(args) == 0:
         worker(sys.stdin, sys.stdout)
