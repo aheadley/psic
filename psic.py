@@ -44,7 +44,7 @@ class CisoWorker(object):
 
 assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
 
-class CompressedBlockIterator(object):
+class IndexedBlockIterator(object):
     def __init__(self, input_handle, align, index_buffer):
         self.input_handle = input_handle
         self.align = align
@@ -94,9 +94,9 @@ class CisoDecompressor(CisoWorker):
         work_func = lambda args: zlib.decompress(args[1], ZLIB_WINDOW_SIZE) \
             if args[0] else args[1]
 
-        block_iter = CompressedBlockIterator(
+        block_iter = IndexedBlockIterator(
             input_handle, header['align'], index_buffer)
-        for block_data in self._pool.map(w, block_iter):
+        for block_data in self._pool.map(work_func, block_iter):
             output_handle.write(block_data)
 
     def _read_header(self, header_bytes):
@@ -122,13 +122,12 @@ class CisoCompressor(CisoWorker):
 
     def __init__(self, threads=None, level=COMPRESSION_LEVEL,
             threshold=COMPRESSION_THRESHOLD, padding_byte=PADDING_BYTE):
+        self._pool = multiprocessing.pool.ThreadPool(threads)
         self.COMPRESSION_LEVEL = level
         self.COMPRESSION_THRESHOLD = threshold
         self.PADDING_BYTE = padding_byte
 
-    def compress(self, input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
-        """Compress a ISO into a CSO
-        """
+    def compress(self, input_handle, output_handle):
         file_size = self._get_stream_size(input_handle)
         if file_size >= 2 ** 31:
             align = 1
@@ -140,35 +139,33 @@ class CisoCompressor(CisoWorker):
         block_count = file_size / self.CISO_BLOCK_SIZE
         index_buffer = [0] * (block_count + 1)
         output_handle.write(b'\x00\x00\x00\x00' * len(index_buffer))
-        compress_block = lambda write_pos: self._compress_block(input_handle.read,
-            write_pos, self.COMPRESSION_THRESHOLD, level, align, self.CISO_BLOCK_SIZE)
-        for block_i in xrange(block_count):
-            index, block = compress_block(output_handle.tell())
+
+        def work_func(data):
+            compressed_data = zlib.compress(data, self.COMPRESSION_LEVEL)[2:]
+            if (100 * len(compressed_data)) / len(data) >= \
+                    self.COMPRESSION_THRESHOLD:
+                return False, data
+            else:
+                return True, compressed_data
+
+        for (block_i, (compressed, data)) in enumerate(self._pool.map(work_func,
+                (input_handle.read(self.CISO_BLOCK_SIZE) for _ in xrange(block_count)))):
+            write_pos = output_handle.tell()
+            padding = self._get_align_padding(write_pos, align)
+            index = (write_pos + len(padding)) >> align
+            if not compressed:
+                index |= self.UNCOMPRESSED_BITMASK
+            elif index & self.UNCOMPRESSED_BITMASK:
+                raise Exception('Align error')
+
             index_buffer[block_i] = index
-            output_handle.write(block)
+            output_handle.write(padding + data)
+
         index_buffer[-1] = output_handle.tell() >> align
 
         output_handle.seek(self.CISO_HEADER_SIZE)
         output_handle.write(struct.pack(self.CISO_INDEX_FMT % len(index_buffer),
             *index_buffer))
-
-    def _compress_block(self, read, write_pos, threshold, level, align, block_size):
-        uncompressed_block = read(block_size)
-        # TODO: error handling here
-        compressed_block = zlib.compress(uncompressed_block, level)[2:]
-        padding = self._get_align_padding(write_pos, align)
-        index = (write_pos + len(padding)) >> align
-        if (100 * len(compressed_block)) / len(uncompressed_block) >= threshold:
-            block = uncompressed_block
-            index |= self.UNCOMPRESSED_BITMASK
-        elif index & self.UNCOMPRESSED_BITMASK:
-            raise Exception('Align error')
-        else:
-            block = compressed_block
-        return index, padding + block
-
-    def _zlib_compress(self, data, level):
-        return zlib.compress(data, level)[2:]
 
     def _get_align_padding(self, write_pos, align):
         align_shift = 1 << align
@@ -196,16 +193,14 @@ class CisoCompressor(CisoWorker):
             0
         )
 
-def compress_helper(data, level):
-    return zlib.compress(data, level)[2:]
-
 def decompress(input_handle, output_handle):
     worker = CisoDecompressor()
     return worker.decompress(input_handle, output_handle)
 
 def compress(input_handle, output_handle, level=ZLIB_DEFAULT_LEVEL):
     worker = CisoCompressor(level=level)
-    return worker.compress(input_handle, output_handle, level)
+    return worker.compress(input_handle, output_handle)
+
 
 if __name__ == '__main__':
     import sys
