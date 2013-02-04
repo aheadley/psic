@@ -44,6 +44,7 @@ class CisoWorker(object):
     UNCOMPRESSED_BITMASK    = 0x80000000
     INDEX_BITMASK           = 0x7FFFFFFF
 
+# sanity check
 assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
 
 class IndexedBlockIterator(object):
