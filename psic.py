@@ -15,8 +15,10 @@ import struct
 import logging
 import os
 import itertools
-import multiprocessing
-import multiprocessing.pool
+try:
+    import multiprocessing as mp
+except ImportError:
+    import multiprocessing.dummy as mp
 
 # constrain the value to 1-9
 ZLIB_DEFAULT_LEVEL  = max(1, min(9, int(os.environ.get('ZLIB_DEFAULT_LEVEL', '1'))))
@@ -36,7 +38,7 @@ class CisoWorker(object):
     CISO_HEADER_SIZE    = 0x18
     CISO_MAGIC      = 0x4F534943 # 'CISO'
     CISO_VER        = 0x01
-    CISO_BLOCK_SIZE = 0x0800
+    CISO_BLOCK_SIZE = 0x0800 # 2048, ISO sector size (maybe?)
     CISO_INDEX_FMT  = '<%dI'
 
     UNCOMPRESSED_BITMASK    = 0x80000000
@@ -49,13 +51,10 @@ class IndexedBlockIterator(object):
         self.input_handle = input_handle
         self.align = align
         self.index_buffer = index_buffer
-        self._read_lock = multiprocessing.Semaphore()
+        self._read_lock = mp.Semaphore()
 
     def __len__(self):
         return len(self.index_buffer) - 1
-
-    def __iter__(self):
-        return self.__call__()
 
     def __call__(self):
         for block_i in xrange(len(self.index_buffer)-1):
@@ -77,10 +76,11 @@ class IndexedBlockIterator(object):
             self._read_lock.release()
             yield compressed, data
 
+    __iter__ = __call__
 
 class CisoDecompressor(CisoWorker):
     def __init__(self, threads=None):
-        self._pool = multiprocessing.pool.Pool(threads)
+        self._pool = mp.Pool(threads)
 
     def decompress(self, input_handle, output_handle):
         """Decompress a CSO
@@ -113,10 +113,11 @@ class CisoDecompressor(CisoWorker):
         return header_data
 
 def _decompress_mp_helper(args):
-    if args[0]:
-        return zlib.decompress(args[1], ZLIB_WINDOW_SIZE)
+    compressed, data = args
+    if compressed:
+        return zlib.decompress(data, ZLIB_WINDOW_SIZE)
     else:
-        return args[1]
+        return data
 
 class CisoCompressor(CisoWorker):
     PADDING_BYTE            = b'X'
@@ -125,7 +126,7 @@ class CisoCompressor(CisoWorker):
 
     def __init__(self, threads=None, level=COMPRESSION_LEVEL,
             threshold=COMPRESSION_THRESHOLD, padding_byte=PADDING_BYTE):
-        self._pool = multiprocessing.pool.ThreadPool(threads)
+        self._pool = mp.Pool(threads)
         self.COMPRESSION_LEVEL = level
         self.COMPRESSION_THRESHOLD = threshold
         self.PADDING_BYTE = padding_byte
@@ -192,9 +193,10 @@ class CisoCompressor(CisoWorker):
         )
 
 def _compress_mp_helper(args):
-    compressed_data = zlib.compress(args[0], args[1])[2:]
-    if (100 * len(compressed_data)) / len(args[0]) >= args[2]:
-        return False, args[0]
+    data, level, threshold = args
+    compressed_data = zlib.compress(data, level)[2:]
+    if (100 * len(compressed_data)) / len(data) >= threshold:
+        return False, data
     else:
         return True, compressed_data
 
