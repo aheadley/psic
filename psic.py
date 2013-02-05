@@ -27,7 +27,7 @@ ZLIB_WINDOW_SIZE    = -15
 class CisoWorker(object):
     CISO_HEADER_FMT     = ''.join([
         '<',    # ensure little endian
-        'I',    # file format magic
+        '4s',   # file format magic
         'I',    # header size
         'Q',    # size of uncompressed file
         'I',    # compressed block size
@@ -36,13 +36,35 @@ class CisoWorker(object):
         'H',    # reserved
     ])
     CISO_HEADER_SIZE    = 0x18
-    CISO_MAGIC      = 0x4F534943 # 'CISO'
+    CISO_MAGIC      = b'CISO' # 0x4F534943
     CISO_VER        = 0x01
     CISO_BLOCK_SIZE = 0x0800 # 2048, ISO sector size (maybe?)
     CISO_INDEX_FMT  = '<%dI'
 
+    ISO_MAGIC           = b'CD001' # 0x4344303031
+    ISO_MAGIC_FMT       = '<5s'
+    ISO_MAGIC_OFFSETS   = (0x8001, 0x8801, 0x9001) # 32KB, 34KB, 36KB
+
     UNCOMPRESSED_BITMASK    = 0x80000000
     INDEX_BITMASK           = 0x7FFFFFFF
+
+    def is_cso(self, stream):
+        current_pos = stream.tell()
+        stream.seek(0)
+        magic = stream.read(len(self.CISO_MAGIC))
+        stream.seek(current_pos)
+        return magic == self.CISO_MAGIC
+
+    def is_iso(self, stream):
+        result = False
+        current_pos = stream.tell()
+        for pos in self.ISO_MAGIC_OFFSETS:
+            stream.seek(pos)
+            if stream.read(len(self.ISO_MAGIC)) == self.ISO_MAGIC:
+                result = True
+                break
+        stream.seek(current_pos)
+        return result
 
 # sanity check
 assert CisoWorker.CISO_HEADER_SIZE == struct.calcsize(CisoWorker.CISO_HEADER_FMT)
