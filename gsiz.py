@@ -8,10 +8,19 @@ ZLIB_DEFAULT_LEVEL  = max(1, min(9, int(os.environ.get('ZLIB_DEFAULT_LEVEL', '1'
 ZLIB_WINDOW_SIZE = -15
 
 class GczError(Exception): pass
+class GczHeaderError(GczError): pass
 
 class GczHeader(object):
     GCZ_MAGIC           = 0xB10BC001;
-    HEADER_STRUCT       = struct.Struct('IIQQII')
+    HEADER_STRUCT       = struct.Struct(''.join([
+        '<',    # little endian
+        'I',    # file format magic
+        'I',    # file sub type (unknown usage)
+        'Q',    # size of compressed file
+        'Q',    # size of uncompressed file
+        'I',    # size of uncompressed block
+        'I',    # number of blocks
+    ]))
     POINTERS_STRUCT_FMT = '%dQ'
     HASHES_STRUCT_FMT   = '%dI'
 
@@ -30,10 +39,10 @@ class GczHeader(object):
         self.num_blocks             = unpacked_data[5]
 
         if self.magic_cookie != self.GCZ_MAGIC:
-            raise GczError('File magic value is wrong: %08X != %08X' % \
+            raise GczHeaderError('File magic value is wrong: %08X != %08X' % \
                 (self.magic_cookie, self.GCZ_MAGIC))
         if (self.block_size * self.num_blocks) != self.data_size:
-            raise GczError('Decompressed data size does not match expected size: %d != %d' % \
+            raise GczHeaderError('Decompressed data size does not match expected size: %d != %d' % \
                 self.block_size * self.num_blocks, self.data_size)
 
         self._load_pointers_and_hashes(handle)
