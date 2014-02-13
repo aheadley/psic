@@ -148,7 +148,7 @@ class GczDecompressor(GczWorker):
             except GczError as err:
                 if skip_broken:
                     print err
-                    block = '\0' * gcz_file.handle.block_size
+                    block = '\0' * gcz_file.header.block_size
                 else:
                     raise err
             output_handle.write(block)
