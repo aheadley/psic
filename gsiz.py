@@ -10,7 +10,7 @@ ZLIB_WINDOW_SIZE = -15
 class GczError(Exception): pass
 
 class GczHeader(object):
-    MAGIC_COOKIE        = 0xB10BC001;
+    GCZ_MAGIC           = 0xB10BC001;
     HEADER_STRUCT       = struct.Struct('IIQQII')
     POINTERS_STRUCT_FMT = '%dQ'
     HASHES_STRUCT_FMT   = '%dI'
@@ -22,8 +22,20 @@ class GczHeader(object):
     def load(self, handle):
         handle.seek(0)
         unpacked_data = self.HEADER_STRUCT.unpack(handle.read(self.size))
-        (self.magic_cookie, self.sub_type, self.compressed_data_size, \
-            self.data_size, self.block_size, self.num_blocks) = unpacked_data
+        self.magic_cookie           = unpacked_data[0]
+        self.sub_type               = unpacked_data[1]
+        self.compressed_data_size   = unpacked_data[2]
+        self.data_size              = unpacked_data[3]
+        self.block_size             = unpacked_data[4]
+        self.num_blocks             = unpacked_data[5]
+
+        if self.magic_cookie != self.GCZ_MAGIC:
+            raise GczError('File magic value is wrong: %08X != %08X' % \
+                (self.magic_cookie, self.GCZ_MAGIC))
+        if (self.block_size * self.num_blocks) != self.data_size:
+            raise GczError('Decompressed data size does not match expected size: %d != %d' % \
+                self.block_size * self.num_blocks, self.data_size)
+
         self._load_pointers_and_hashes(handle)
 
     @property
@@ -55,69 +67,99 @@ class GczFile(object):
         self.header = GczHeader(handle)
 
     def __len__(self):
-        return len(self.header.block_pointers)
+        return self.header.num_blocks
 
-    def get_block_compressed_size(self, block_num):
-        start_pos = self.header.block_pointers[block_num]
-        if block_num < self.header.num_blocks - 1:
-            return self.header.block_pointers[block_num + 1] - start_pos
-        elif block_num == header.num_blocks - 1:
-            return self.header.compressed_data_size - start_pos
-        else:
+    def get_block_size(self, block_num):
+        try:
+            block_start = self.get_block_start(block_num)
+        except IndexError:
             raise GczError('Illegal block number: %d' % block_num)
 
+        if block_num == (self.header.num_blocks - 1):
+            block_end = self.header.compressed_data_size
+        else:
+            block_end = self.get_block_start(block_num+1)
+
+        return block_end - block_start
+
+    def get_block_start(self, block_num):
+        block_offset = self.header.block_pointers[block_num]
+        if self.get_block_is_uncompressed(block_num):
+            block_offset &= ~(1 << 63)
+        return block_offset
+
+    def get_block_is_uncompressed(self, block_num):
+        return bool(self.header.block_pointers[block_num] & (1 << 63))
+
     def compute_block_hash(self, block_data):
-        return zlib.adler32(block_data)
+        return zlib.adler32(block_data) & 0xFFFFFFFF
 
     def check_block_hash(self, block_num, block_data):
         return self.compute_block_hash(block_data) == self.handle.block_hashes[block_num]
 
     def get_block(self, block_num):
-        compressed = True
-        compressed_block_size = self.get_block_compressed_size(block_num)
+        block_size = self.get_block_size(block_num)
 
-        block_offset = self.header.block_pointers[block_num] + self.header.full_size
-
-        if block_offset & (1 << 63):
-            if compressed_block_size != self.header.block_size:
-                raise GczError('Uncompressed block with wrong size')
+        if self.get_block_is_uncompressed(block_num):
+            if block_size != self.header.block_size:
+                raise GczError('Uncompressed block [%d] with wrong size: %d != %d' % \
+                    (block_num, block_size, self.header.block_size))
             compressed = False
-            block_offset &= ~(1 << 63)
+        else:
+            if block_size > self.header.block_size:
+                raise GczError('Compressed block [%d] larger than largest possible block size: %d > %d' % \
+                    (block_num, block_size, self.header.block_size))
+            compressed = True
 
-        self._handle.seek(block_offset)
-        block_data = self._handle.read(compressed_block_size)
+        self._handle.seek(self.header.full_size + self.get_block_start(block_num))
+        block_data = self._handle.read(block_size)
 
         block_hash = self.compute_block_hash(block_data)
         if block_hash != self.header.block_hashes[block_num]:
-            raise GczError('Hash of block %d is wrong: %08x != %08x' % \
+            raise GczError('Hash of block [%d] is wrong: %08X != %08X' % \
                 (block_num, block_hash, self.header.block_hashes[block_num]))
 
-        if not compressed:
+        if compressed:
+            block_data = zlib.decompress(block_data)
+            if len(block_data) != self.header.block_size:
+                raise GczError('Decompressed block [%d] is wrong size: %d != %d' % \
+                    (block_num, len(block_data), self.header.block_size))
             return block_data
         else:
-            decompressed_block_data = zlib.decompress(block_data, ZLIB_WINDOW_SIZE)
-            if len(decompressed_block_data) != self.header.block_size:
-                raise GczError('Decompressed block is wrong size: %d != %d' % \
-                    (len(decompressed_block_data), self.header.block_size))
-            return decompressed_block_data
+            return block_data
 
 class GczWorker(object):
     def __init__(self):
         pass
 
 class GczDecompressor(GczWorker):
-    def decompress(self, input_handle, output_handle):
+    def decompress(self, input_handle, output_handle, observer=None):
         gcz_file = GczFile(input_handle)
-
+        if observer is not None:
+            observer.maxval = len(gcz_file)
+            observer.start()
         for i in xrange(len(gcz_file)):
             output_handle.write(gcz_file.get_block(i))
+            if observer is not None and i % 10 == 0:
+                observer.update(i)
+        if observer is not None:
+            observer.update(len(gcz_file))
 
 if __name__ == '__main__':
     import sys
+    try:
+        import progressbar
+    except ImportError:
+        progressbar = None
 
     input_filename = sys.argv[1]
     output_filename = sys.argv[2]
 
+    if progressbar is not None:
+        obs = progressbar.ProgressBar()
+    else:
+        obs = None
+
     with open(output_filename, 'wb') as output_handle:
         with open(input_filename, 'rb') as input_handle:
-            GczDecompressor().decompress(input_handle, output_handle)
+            GczDecompressor().decompress(input_handle, output_handle, obs)
